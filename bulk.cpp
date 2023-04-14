@@ -80,112 +80,243 @@ bulk1517223860.log , где 1517223860 - это время получения п
 #include <fstream>
 #include <cstdlib>
 #include <string>
-#include <vector>
+#include <list>
 #include <chrono>
 #include <sstream>
+#include <memory>
 
-/**
- * @brief Class to store and manipulate detected commands sequence.
- * @details
- *  Manages container where bulk of comands are stored.\n
- *  Comands may be inserted, printed on console and serialized to a file.
- */
-class Bulk
+class Observer
 {
-private:
-    std::vector<std::string> data; /**< Container storing commands */
-    std::string fn; /**< File name to save this bulk. */
+public:
+    virtual void startBlock() = 0;
+    virtual void setNextCommand(const std::string &) = 0;
+    virtual void finalizeBlock() = 0;
+};
+
+class Observable
+{
+public:
+    virtual ~Observable() = default;
+    virtual void subscribe(const std::shared_ptr<Observer> &obs) = 0;
+};
+
+class CommandProcessor : public Observable
+{
+    std::list<std::weak_ptr<Observer>> m_subs;
+    int bulk_depth{0};
+    int bulk_size{0};
+    int max_bulk{3};
 
 public:
-    /** @brief Number of commands stored.
-     * @returns container size, storing entered commands.
-     */
-    size_t size() const
+    CommandProcessor() = default;
+    CommandProcessor(int N) : max_bulk{N} {}
+
+    enum Events
     {
-        return data.size();
-    }
-    /**
-     * @brief Inters a command at the end of a bulk.
-     * @param cmd [in] The command string to be inserted.
-     * @details Inters a command, represented by a refference to string, at the end of a bulk.
-     *          When inserting the first command (supposedly) unique file name is generated and
-     *          stored using steady clock count.
-     */
-    void insert(const std::string &cmd)
+        StartBlock,
+        EndBlock,
+        NewCommand
+    };
+
+    void subscribe(const std::shared_ptr<Observer> &obs) override
     {
-        if(!size())
-            fn = time_to_filename(std::chrono::steady_clock::now());
-        data.push_back(cmd);
+        m_subs.emplace_back(obs);
     }
-    /**
-     * @brief Write bulk first to console, then to file.
-     * @details After displaying bulk on the console data is saved to a file with
-     *          a name generated at the moment whn first command was inserted.
-    */
-    void output() const
+
+    void notify(Events e, const std::string &cmd)
     {
-        write_to(std::cout);
-        std::ofstream f{fn};
-        write_to(f);
-    }
-    /**
-     * @brief Output all commands from a buffer to the specified stream.
-     * @param [in] os Stream to write commands.
-     * @details Commands are writen in one line starting with `bulk: ', comma plus whitespace (', ') separated.
-    */
-    void write_to(std::ostream &os) const {
-        if (size())
+        auto iter = m_subs.begin();
+        while (iter != m_subs.end())
         {
-            os << "bulk: ";
-            for (auto &c : data)
-            {
-                if (&c != &data[0])
-                    os << ", ";
-                os << c;
+            auto ptr = iter->lock();
+            if (ptr)
+            { // notify subscriber if it still survived
+                switch (e)
+                {
+                case StartBlock:
+                    ptr->startBlock();
+                    break;
+                case EndBlock:
+                    ptr->finalizeBlock();
+                    break;
+                case NewCommand:
+                    ptr->setNextCommand(cmd);
+                    break;
+                }
+                ++iter;
             }
-            os << '\n';
+            else
+            { // subscriber is dead
+                m_subs.erase(iter++);
+            }
         }
     }
-    /** @brief Erases contents of a bulk object.
-     * @details Deletes all elements (commands).
-     */
-    void clear()
+
+    void addCommand(const std::string &cmd)
     {
+        if (!bulk_size)
+            notify(StartBlock, "");
+        bulk_size++;
+        notify(NewCommand, cmd);
+    }
+
+    void endBlock()
+    {
+        notify(EndBlock, "");
+        bulk_size = 0;
+    }
+
+    void onInput(const std::string &cmd)
+    {
+        if (bulk_size < max_bulk || bulk_depth > 0)
+        {
+
+            if (cmd.find('{') != std::string::npos)
+            {
+                if (!bulk_depth && bulk_size)
+                {
+                    endBlock();
+                }
+                ++bulk_depth;
+            }
+            else if (bulk_depth && cmd.find('}') != std::string::npos)
+            {
+                if (--bulk_depth == 0)
+                {
+                    endBlock();
+                }
+            }
+            else
+            {
+                addCommand(cmd);
+            }
+        }
+        if (bulk_size >= max_bulk && !bulk_depth)
+        {
+            endBlock();
+        }
+    }
+
+    void terminate()
+    {
+        if (bulk_size && !bulk_depth)
+            endBlock();
+    }
+};
+
+class OstreamLogger : public Observer, public std::enable_shared_from_this<OstreamLogger>
+{
+public:
+    static std::shared_ptr<OstreamLogger> create(CommandProcessor *cp)
+    {
+        auto ptr = std::shared_ptr<OstreamLogger>{new OstreamLogger{}};
+        ptr->subscribe(cp);
+        return ptr;
+    }
+    void subscribe(CommandProcessor *cp)
+    {
+        cp->subscribe(shared_from_this());
+    }
+
+    void startBlock() override
+    {
+    }
+
+    void setNextCommand(const std::string &cmd) override
+    {
+        data.push_back(cmd);
+    }
+
+    void finalizeBlock() override
+    {
+        std::cout << "bulk: ";
+        for (auto &c : data)
+        {
+            if (&c != &(*data.begin()))
+                std::cout << ", ";
+            std::cout << c;
+        }
+        std::cout << '\n';
+
         data.clear();
     }
-    /** @brief Outputs and then erases contents of a bulk object.
-     * @details Stored commands first are output to console and then to file.\n
-     *          Then the bulk contents are erased.
-     */
-    void flush()
+
+private:
+    OstreamLogger() = default;
+    std::list<std::string> data;
+};
+
+class FileLogger : public Observer, public std::enable_shared_from_this<FileLogger>
+{
+public:
+    static std::shared_ptr<FileLogger> create(CommandProcessor *cp)
     {
-        output();
-        clear();
+        auto ptr = std::shared_ptr<FileLogger>{new FileLogger{}};
+        ptr->subscribe(cp);
+        return ptr;
     }
+    void subscribe(CommandProcessor *cp)
+    {
+        cp->subscribe(shared_from_this());
+    }
+
+    void startBlock() override
+    {
+        log_name = time_to_filename(std::chrono::steady_clock::now());
+    }
+
+    void setNextCommand(const std::string &cmd) override
+    {
+        data.push_back(cmd);
+    }
+
+    void finalizeBlock() override
+    {
+        std::ofstream log(log_name);
+
+        log << "bulk: ";
+        for (auto &c : data)
+        {
+            if (&c != &(*data.begin()))
+                log << ", ";
+            log << c;
+        }
+        log << '\n';
+
+        data.clear();
+    }
+
     /**
      * @brief Create file name string based on time point.
      * @param [in] t Reference to time_point structure.
      * @details Converts time point to a readable string of a microseconds since epoch start,
      *           then combines file name starting with "bulk" and ending on ".log" extension.
-    */
-    std::string time_to_filename(const std::chrono::time_point<std::chrono::steady_clock> &t) const {
-        std::string fn {"bulk" +
-            std::to_string(
-                std::chrono::duration_cast<std::chrono::microseconds>(t.time_since_epoch()).count()
-                ) + ".log"};
+     */
+    std::string time_to_filename(const std::chrono::time_point<std::chrono::steady_clock> &t) const
+    {
+        std::string fn{"bulk" +
+                       std::to_string(
+                           std::chrono::duration_cast<std::chrono::microseconds>(t.time_since_epoch()).count()) +
+                       ".log"};
         return fn;
     }
+
+private:
+    FileLogger() = default;
+    std::list<std::string> data;
+    std::string log_name;
 };
+
 /**
- * @brief main function that implements business logic.
+ * @brief main function.
  * @param argc [in] Number of a program parameters strings.
  * @param argv [in] Array of pointers to c-style char arrays, storing program parameters
  * @returns Exit status - 0 (EXIT_SUCCESS) on success, non-zero (EXIT_FAILURE) on failure.
- * @details Almost all business logic implementation is withing main() function. See \ref business_logic "mainpage" for detailed description.
-*/
+ * @details Business logic implementation has been moved to CommandProcessor class methods.
+ * See \ref business_logic "mainpage" for detailed description.
+ */
 int main(int argc, char const *argv[])
 {
-
     size_t N{3};
     if (argc < 2 || (N = std::stoi(argv[1])) <= 0)
     {
@@ -193,40 +324,17 @@ int main(int argc, char const *argv[])
         return EXIT_FAILURE;
     }
 
-    while (!std::cin.eof())
+    CommandProcessor commands(N);
+
+    std::shared_ptr<OstreamLogger> coutPtr = OstreamLogger::create(&commands);
+    std::shared_ptr<FileLogger> filePtr = FileLogger::create(&commands);
+
+    std::string cmd;
+    while (std::getline(std::cin, cmd))
     {
-        int block_depth{0};
-        Bulk blk;
-        while (blk.size() < N || block_depth > 0)
-        {
-            std::string cmd;
-            if (!std::getline(std::cin, cmd))
-            {
-                break;
-            }
-            if (cmd.find('{') != std::string::npos)
-            {
-                if (!block_depth)
-                {
-                    blk.flush();
-                }
-                ++block_depth;
-            }
-            else if (block_depth && cmd.find('}') != std::string::npos)
-            {
-                if (--block_depth == 0)
-                {
-                    break;
-                }
-            }
-            else
-            {
-                blk.insert(cmd);
-            }
-        }
-        if(!block_depth)
-            blk.flush();
+        commands.onInput(cmd);
     }
+    commands.terminate();
 
     return EXIT_SUCCESS;
 }

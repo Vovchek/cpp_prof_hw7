@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - low_coupling
       - feature/github_actions
   # позволяет запускать workflow вручную с вкладки actions в интерфейсе github.com
   workflow_dispatch:
